@@ -1,21 +1,33 @@
-// DisplayCtl - attach/detach one specific display path via the CCD API.
+// DisplayCtl - attach/detach displays via the CCD API, allocating a distinct
+// source per monitor.
 //
-// Why this exists: DisplaySwitch.exe /extend applies a blanket "extend" topology
-// and will not re-attach certain detached panels - on this machine SAC2453 and
-// EDR2380 stay dark through it even though both are healthy in hardware. Windows
-// Settings CAN reconnect them, because "Extend desktop to this display" enables
-// one specific path rather than applying a topology preset. That is what this
-// does: QueryDisplayConfig for every path including inactive ones, flip the
-// ACTIVE flag on the one you name, and hand the whole set back to Windows.
+// Why this exists: DisplaySwitch.exe /extend will not re-attach the panels that
+// ipad mode detaches, and MultiMonitorTool cannot address a detached display at
+// all (it exposes no Monitor ID). Windows Settings CAN reconnect them, because it
+// enables a specific path rather than applying a topology preset.
+//
+// THE THING THAT MAKES THIS WORK: QueryDisplayConfig(QDC_ALL_PATHS) returns every
+// legal source->target combination, in priority order. Naively activating the
+// first candidate for each monitor gives every one of them source 0 - and in the
+// Windows display model, several active targets sharing one source is a CLONE
+// GROUP, not an extended desktop. That is why an earlier version of this tool
+// produced "four active CCD paths, two screens in GDI": SetDisplayConfig was not
+// failing, it was faithfully building the clone topology it had been handed.
+//
+// So this allocates. It reserves the sources already used by displays it is not
+// rebuilding, then for each requested monitor picks an ALREADY ENUMERATED path
+// whose source is still free. Source ids are never rewritten - inventing
+// source->target pairings Windows did not enumerate yields ERROR_INVALID_PARAMETER
+// (87), which is what an earlier attempt here did.
 //
 // Usage:
-//   DisplayCtl.exe list                  - every path, active or not
-//   DisplayCtl.exe enable  <match>       - attach paths whose device path/name matches
-//   DisplayCtl.exe disable <match>       - detach them
+//   DisplayCtl.exe list                       - every path, active or not
+//   DisplayCtl.exe enable  <match> [<match>…] - attach; pass ALL targets at once
+//   DisplayCtl.exe disable <match> [<match>…] - detach
+//   ... --save                                - also persist to the config database
 //
-// <match> is a case-insensitive substring of the monitor device path (e.g.
-// "SAC2453") or of the friendly name. Exit code 0 = applied, 1 = nothing matched
-// or the call failed.
+// Pass every monitor you want on in a single enable call. Enabling them one at a
+// time makes each new path claim the source the previous one just took.
 //
 // Build:  csc /target:exe /out:DisplayCtl.exe DisplayCtl.cs
 
@@ -64,14 +76,11 @@ static class Native
         public uint flags;
     }
 
-    // We never inspect mode contents - they are re-derived by Windows - so the
-    // union is just a correctly sized blob. Declared as real fields rather than
-    // an empty Explicit struct, which does not marshal reliably.
+    // Mode contents are never inspected here - Windows re-derives them - so the
+    // union is just a correctly sized blob. Real fields rather than an empty
+    // Explicit struct, which does not marshal reliably.
     [StructLayout(LayoutKind.Sequential)]
-    public struct MODE_UNION
-    {
-        public ulong a, b, c, d, e, f;
-    }
+    public struct MODE_UNION { public ulong a, b, c, d, e, f; }
 
     [StructLayout(LayoutKind.Sequential)]
     public struct MODE_INFO
@@ -101,18 +110,22 @@ static class Native
         [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)] public string monitorDevicePath;
     }
 
-    public const uint QDC_ALL_PATHS = 0x00000001;
+    public const uint QDC_ALL_PATHS          = 0x00000001;
+    // Required once a virtual display is in the topology: Win10+ paths can use
+    // the packed source/target mode-index fields, and a non-aware query returns a
+    // view that does not round-trip cleanly back through SetDisplayConfig.
+    public const uint QDC_VIRTUAL_MODE_AWARE = 0x00000010;
 
     public const uint SDC_USE_SUPPLIED_DISPLAY_CONFIG = 0x00000020;
+    public const uint SDC_VALIDATE                    = 0x00000040;
     public const uint SDC_APPLY                       = 0x00000080;
     public const uint SDC_SAVE_TO_DATABASE            = 0x00000200;
     public const uint SDC_ALLOW_CHANGES               = 0x00000400;
-    public const uint SDC_ALLOW_PATH_ORDER_CHANGES    = 0x00002000;
-    public const uint SDC_TOPOLOGY_SUPPLIED           = 0x00000010;
+    public const uint SDC_VIRTUAL_MODE_AWARE          = 0x00008000;
 
-    public const uint PATH_ACTIVE          = 0x00000001;
-    public const uint MODE_IDX_INVALID     = 0xffffffff;
-    public const uint GET_TARGET_NAME      = 2;
+    public const uint PATH_ACTIVE      = 0x00000001;
+    public const uint MODE_IDX_INVALID = 0xffffffff;
+    public const uint GET_TARGET_NAME  = 2;
 
     [DllImport("user32.dll")]
     public static extern int GetDisplayConfigBufferSizes(uint flags, out uint numPaths, out uint numModes);
@@ -147,28 +160,49 @@ class Program
         return true;
     }
 
+    // A source belongs to one adapter, so the adapter LUID is part of its identity.
+    static string SourceKey(Native.PATH_INFO p)
+    {
+        return p.sourceInfo.adapterId.HighPart + ":" + p.sourceInfo.adapterId.LowPart
+             + ":" + p.sourceInfo.id;
+    }
+
+    static bool Matches(string devicePath, string friendly, List<string> matches)
+    {
+        foreach (var m in matches)
+        {
+            if (devicePath.IndexOf(m, StringComparison.OrdinalIgnoreCase) >= 0
+             || friendly.IndexOf(m, StringComparison.OrdinalIgnoreCase) >= 0) return true;
+        }
+        return false;
+    }
+
     static int Main(string[] args)
     {
         if (args.Length < 1)
         {
-            Console.Error.WriteLine("usage: DisplayCtl.exe list | enable <match> | disable <match>");
+            Console.Error.WriteLine("usage: DisplayCtl.exe list | enable <match>... | disable <match>... [--save]");
             return 1;
         }
         string cmd = args[0].ToLowerInvariant();
-        // Several targets may be given. They MUST be applied in a single call:
-        // activating paths one at a time makes each new path steal a source slot
-        // from the previous one, so the panels knock each other back off.
         var matches = new List<string>();
-        for (int ai = 1; ai < args.Length; ai++) matches.Add(args[ai]);
+        bool save = false;
+        for (int i = 1; i < args.Length; i++)
+        {
+            if (string.Equals(args[i], "--save", StringComparison.OrdinalIgnoreCase)) { save = true; continue; }
+            matches.Add(args[i]);
+        }
+
+        uint queryFlags = Native.QDC_ALL_PATHS | Native.QDC_VIRTUAL_MODE_AWARE;
 
         uint numPaths, numModes;
-        if (Native.GetDisplayConfigBufferSizes(Native.QDC_ALL_PATHS, out numPaths, out numModes) != 0)
+        if (Native.GetDisplayConfigBufferSizes(queryFlags, out numPaths, out numModes) != 0)
         {
             Console.Error.WriteLine("GetDisplayConfigBufferSizes failed"); return 1;
         }
         var paths = new Native.PATH_INFO[numPaths];
         var modes = new Native.MODE_INFO[numModes];
-        if (Native.QueryDisplayConfig(Native.QDC_ALL_PATHS, ref numPaths, paths, ref numModes, modes, IntPtr.Zero) != 0)
+        if (Native.QueryDisplayConfig(queryFlags, ref numPaths, paths, ref numModes, modes, IntPtr.Zero) != 0)
         {
             Console.Error.WriteLine("QueryDisplayConfig failed"); return 1;
         }
@@ -180,134 +214,176 @@ class Program
                 string dp, fr;
                 if (!TryGetName(paths[i], out dp, out fr)) continue;
                 bool active = (paths[i].flags & Native.PATH_ACTIVE) != 0;
-                Console.WriteLine("{0,-8} avail={1,-5} {2,-28} {3}",
-                    active ? "ACTIVE" : "off", paths[i].targetInfo.targetAvailable != 0, fr, dp);
+                string smi = paths[i].sourceInfo.modeInfoIdx == Native.MODE_IDX_INVALID ? "-" : paths[i].sourceInfo.modeInfoIdx.ToString();
+                string tmi = paths[i].targetInfo.modeInfoIdx == Native.MODE_IDX_INVALID ? "-" : paths[i].targetInfo.modeInfoIdx.ToString();
+                Console.WriteLine("{0,-6} avail={1,-5} adapter={2}:{3} src={4,-3} tgt={5,-9} srcMode={6,-3} tgtMode={7,-3} {8}",
+                    active ? "ACTIVE" : "off",
+                    paths[i].targetInfo.targetAvailable != 0,
+                    paths[i].sourceInfo.adapterId.HighPart, paths[i].sourceInfo.adapterId.LowPart,
+                    paths[i].sourceInfo.id, paths[i].targetInfo.id, smi, tmi, fr);
             }
             return 0;
         }
 
-        if (matches.Count == 0)
+        if (cmd == "selftest")
         {
-            Console.Error.WriteLine("at least one <match> argument is required for " + cmd); return 1;
+            // Validate the CURRENT configuration, unmodified. If this fails, the
+            // problem is the flags or the array handling, not the allocation.
+            var combos = new List<KeyValuePair<string,uint>>();
+            combos.Add(new KeyValuePair<string,uint>("supplied+changes+vma", Native.SDC_USE_SUPPLIED_DISPLAY_CONFIG|Native.SDC_ALLOW_CHANGES|Native.SDC_VIRTUAL_MODE_AWARE));
+            combos.Add(new KeyValuePair<string,uint>("supplied+changes",     Native.SDC_USE_SUPPLIED_DISPLAY_CONFIG|Native.SDC_ALLOW_CHANGES));
+            combos.Add(new KeyValuePair<string,uint>("supplied+vma",         Native.SDC_USE_SUPPLIED_DISPLAY_CONFIG|Native.SDC_VIRTUAL_MODE_AWARE));
+            combos.Add(new KeyValuePair<string,uint>("supplied only",        Native.SDC_USE_SUPPLIED_DISPLAY_CONFIG));
+            var act = new List<Native.PATH_INFO>();
+            for (int i = 0; i < numPaths; i++) if ((paths[i].flags & Native.PATH_ACTIVE) != 0) act.Add(paths[i]);
+            var actArr = act.ToArray();
+            Console.WriteLine("paths={0} active={1} modes={2}", numPaths, actArr.Length, numModes);
+            foreach (var c in combos)
+            {
+                int a = Native.SetDisplayConfig(numPaths, paths, numModes, modes, Native.SDC_VALIDATE | c.Value);
+                int b = Native.SetDisplayConfig((uint)actArr.Length, actArr, numModes, modes, Native.SDC_VALIDATE | c.Value);
+                Console.WriteLine("  {0,-22} allPaths->{1,-4} activeOnly->{2}", c.Key, a, b);
+            }
+            return 0;
         }
-        bool wantActive = (cmd == "enable");
         if (cmd != "enable" && cmd != "disable")
         {
             Console.Error.WriteLine("unknown command: " + cmd); return 1;
         }
-
-        // A monitor is reachable through several candidate paths (different source
-        // pairings) but only ONE may be active at a time. So when enabling, take
-        // the first usable path per monitor and leave its siblings alone -
-        // activating them all produces a conflicting topology that gets rejected.
-        var alreadyActive = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        for (int i = 0; i < numPaths; i++)
+        if (matches.Count == 0)
         {
-            string dp0, fr0;
-            if (!TryGetName(paths[i], out dp0, out fr0)) continue;
-            if ((paths[i].flags & Native.PATH_ACTIVE) != 0) alreadyActive.Add(dp0);
+            Console.Error.WriteLine("at least one <match> argument is required for " + cmd); return 1;
         }
 
-        var handled = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        var enabledIdx = new List<int>();
-        int hits = 0;
+        uint supplied = Native.SDC_USE_SUPPLIED_DISPLAY_CONFIG
+                      | Native.SDC_ALLOW_CHANGES
+                      | Native.SDC_VIRTUAL_MODE_AWARE;   // required: without it even
+                                                         // the current config fails validation
+
+        if (cmd == "disable")
+        {
+            int changes = 0;
+            for (int i = 0; i < numPaths; i++)
+            {
+                string dp, fr;
+                if (!TryGetName(paths[i], out dp, out fr)) continue;
+                if (!Matches(dp, fr, matches)) continue;
+                if ((paths[i].flags & Native.PATH_ACTIVE) == 0) continue;
+                paths[i].flags &= ~Native.PATH_ACTIVE;
+                changes++;
+                Console.WriteLine("disabling src={0} tgt={1} {2}", paths[i].sourceInfo.id, paths[i].targetInfo.id, fr);
+            }
+            if (changes == 0) { Console.WriteLine("nothing to change"); return 0; }
+            int drc = Native.SetDisplayConfig(numPaths, paths, numModes, modes, Native.SDC_VALIDATE | supplied);
+            Console.WriteLine("validate -> " + drc);
+            if (drc != 0) { Console.Error.WriteLine("rejected; nothing applied"); return 1; }
+            uint df = Native.SDC_APPLY | supplied;
+            if (save) df |= Native.SDC_SAVE_TO_DATABASE;
+            drc = Native.SetDisplayConfig(numPaths, paths, numModes, modes, df);
+            Console.WriteLine("apply -> " + drc);
+            return drc == 0 ? 0 : 1;
+        }
+
+        // ENABLE.
+        //
+        // Picking the first free source per monitor produces a legal-looking
+        // assignment that Windows still rejects - not every source can drive every
+        // target on this hardware. Rather than guess, enumerate the candidate rows
+        // per monitor and SEARCH: try each combination of distinct sources and ask
+        // SDC_VALIDATE which one is actually legal. Nothing is applied until a
+        // combination validates, so a wrong guess costs nothing.
+        var reserved = new HashSet<string>();
+        for (int i = 0; i < numPaths; i++)
+        {
+            if ((paths[i].flags & Native.PATH_ACTIVE) == 0) continue;
+            string dp, fr;
+            if (!TryGetName(paths[i], out dp, out fr)) continue;
+            if (Matches(dp, fr, matches)) continue;   // being rebuilt
+            reserved.Add(SourceKey(paths[i]));
+        }
+
+        // Candidate rows per monitor, keyed by device path, in enumeration order.
+        var targetOrder = new List<string>();
+        var candidates = new Dictionary<string, List<int>>();
+        var friendlyOf = new Dictionary<string, string>();
         for (int i = 0; i < numPaths; i++)
         {
             string dp, fr;
             if (!TryGetName(paths[i], out dp, out fr)) continue;
-            bool isMatch = false;
-            foreach (var mm in matches)
-            {
-                if (dp.IndexOf(mm, StringComparison.OrdinalIgnoreCase) >= 0
-                 || fr.IndexOf(mm, StringComparison.OrdinalIgnoreCase) >= 0) { isMatch = true; break; }
-            }
-            if (!isMatch) continue;
+            if (!Matches(dp, fr, matches)) continue;
+            if (paths[i].targetInfo.targetAvailable == 0) continue;
+            if (!candidates.ContainsKey(dp)) { candidates[dp] = new List<int>(); targetOrder.Add(dp); friendlyOf[dp] = fr; }
+            if (reserved.Contains(SourceKey(paths[i]))) continue;   // source belongs to someone else
+            candidates[dp].Add(i);
+        }
+        foreach (var dp in targetOrder)
+            Console.WriteLine("{0}: {1} candidate path(s)", friendlyOf[dp], candidates[dp].Count);
+        if (targetOrder.Count == 0) { Console.WriteLine("nothing to change"); return 0; }
 
-            if (wantActive)
+        // Baseline: every path with the rebuilt targets switched off.
+        var baseline = (Native.PATH_INFO[])paths.Clone();
+        for (int i = 0; i < numPaths; i++)
+        {
+            string dp, fr;
+            if (!TryGetName(baseline[i], out dp, out fr)) continue;
+            if (Matches(dp, fr, matches)) baseline[i].flags &= ~Native.PATH_ACTIVE;
+        }
+
+        int[] pick = new int[targetOrder.Count];
+        int attempts = 0;
+        Native.PATH_INFO[] winner = null;
+
+        Func<int, HashSet<string>, bool> search = null;
+        search = delegate(int depth, HashSet<string> usedSources)
+        {
+            if (depth == targetOrder.Count)
             {
-                if (paths[i].targetInfo.targetAvailable == 0)
+                var cand = (Native.PATH_INFO[])baseline.Clone();
+                for (int k = 0; k < pick.Length; k++)
                 {
-                    Console.WriteLine("skip (not physically available): " + fr);
-                    continue;
+                    int idx = pick[k];
+                    cand[idx].flags |= Native.PATH_ACTIVE;
+                    cand[idx].sourceInfo.modeInfoIdx = Native.MODE_IDX_INVALID;
+                    cand[idx].targetInfo.modeInfoIdx = Native.MODE_IDX_INVALID;
                 }
-                if (handled.Contains(dp)) continue;   // sibling path for the same monitor
-                // NOTE: a path can carry the ACTIVE flag while the display does not
-                // actually exist in GDI - the CCD table and the live desktop drift
-                // apart. So never treat "flag already set" as "nothing to do";
-                // re-apply regardless, which is what forces Windows to materialise it.
-                if (!alreadyActive.Contains(dp)) paths[i].flags |= Native.PATH_ACTIVE;
-                enabledIdx.Add(i);
-                handled.Add(dp);
+                attempts++;
+                int vrc = Native.SetDisplayConfig(numPaths, cand, numModes, modes, Native.SDC_VALIDATE | supplied);
+                if (vrc == 0) { winner = cand; return true; }
+                return false;
             }
-            else
+            foreach (int idx in candidates[targetOrder[depth]])
             {
-                if ((paths[i].flags & Native.PATH_ACTIVE) == 0) continue;
-                paths[i].flags &= ~Native.PATH_ACTIVE;
+                string sk = SourceKey(paths[idx]);
+                if (usedSources.Contains(sk)) continue;
+                usedSources.Add(sk);
+                pick[depth] = idx;
+                if (search(depth + 1, usedSources)) return true;
+                usedSources.Remove(sk);
             }
-            hits++;
-            Console.WriteLine((wantActive ? "enabling: " : "disabling: ") + fr + "  " + dp);
+            return false;
+        };
+
+        search(0, new HashSet<string>(reserved));
+
+        if (winner == null)
+        {
+            Console.Error.WriteLine("no valid source assignment found after " + attempts + " combinations");
+            return 1;
         }
 
-        if (hits == 0)
+        for (int k = 0; k < pick.Length; k++)
         {
-            // Nothing changed. If the targets are already in the requested state
-            // that is success, not failure.
-            Console.WriteLine("nothing to change");
-            return 0;
+            int idx = pick[k];
+            string dp2, fr2;
+            TryGetName(paths[idx], out dp2, out fr2);
+            Console.WriteLine("selected src={0} tgt={1} {2}", paths[idx].sourceInfo.id, paths[idx].targetInfo.id, fr2);
         }
+        Console.WriteLine("validated after " + attempts + " combination(s)");
 
-        // Windows is fussy about exactly what combination it will accept here, and
-        // which one works depends on the driver and the current topology. Rather
-        // than guess, try the sensible variants in order and report which landed.
-        // Clear the mode indices of just the paths we are turning on, so Windows
-        // allocates them fresh source slots. Leaving their queried indices in place
-        // is what makes two targets collide on one source - the call then succeeds
-        // while the display never appears.
-        if (wantActive)
-        {
-            foreach (int ei in enabledIdx)
-            {
-                paths[ei].sourceInfo.modeInfoIdx = Native.MODE_IDX_INVALID;
-                paths[ei].targetInfo.modeInfoIdx = Native.MODE_IDX_INVALID;
-            }
-        }
-
-        uint baseFlags = Native.SDC_APPLY | Native.SDC_USE_SUPPLIED_DISPLAY_CONFIG | Native.SDC_ALLOW_CHANGES;
-
-        var attempts = new List<KeyValuePair<string, Func<int>>>();
-
-        // 1. Topology-only apply: paths, no modes. This is the legal way to pass a
-        //    null mode array - SDC_USE_SUPPLIED_DISPLAY_CONFIG requires modes.
-        attempts.Add(new KeyValuePair<string, Func<int>>("topology supplied", () =>
-        {
-            var keep = new List<Native.PATH_INFO>();
-            for (int i = 0; i < numPaths; i++)
-                if ((paths[i].flags & Native.PATH_ACTIVE) != 0) keep.Add(paths[i]);
-            var arr = keep.ToArray();
-            return Native.SetDisplayConfig((uint)arr.Length, arr, 0, null,
-                   Native.SDC_APPLY | Native.SDC_TOPOLOGY_SUPPLIED | Native.SDC_ALLOW_PATH_ORDER_CHANGES);
-        }));
-
-        // 2. Fall back to supplied paths with the modes exactly as queried.
-        attempts.Add(new KeyValuePair<string, Func<int>>("supplied paths + queried modes",
-            () => Native.SetDisplayConfig(numPaths, paths, numModes, modes, baseFlags | Native.SDC_SAVE_TO_DATABASE)));
-
-        // 2. Same, but let Windows reorder paths.
-        attempts.Add(new KeyValuePair<string, Func<int>>("+ allow path order changes",
-            () => Native.SetDisplayConfig(numPaths, paths, numModes, modes,
-                  baseFlags | Native.SDC_SAVE_TO_DATABASE | Native.SDC_ALLOW_PATH_ORDER_CHANGES)));
-
-        // 3. Without saving to the persistence database.
-        attempts.Add(new KeyValuePair<string, Func<int>>("without save-to-database",
-            () => Native.SetDisplayConfig(numPaths, paths, numModes, modes, baseFlags)));
-
-        foreach (var a in attempts)
-        {
-            int rc = a.Value();
-            if (rc == 0) { Console.WriteLine("applied (" + a.Key + ")"); return 0; }
-            Console.WriteLine("  tried " + a.Key + " -> code " + rc);
-        }
-        Console.Error.WriteLine("SetDisplayConfig rejected every variant");
-        return 1;
+        uint af = Native.SDC_APPLY | supplied;
+        if (save) af |= Native.SDC_SAVE_TO_DATABASE;
+        int rc = Native.SetDisplayConfig(numPaths, winner, numModes, modes, af);
+        Console.WriteLine("apply -> " + rc);
+        return rc == 0 ? 0 : 1;
     }
 }

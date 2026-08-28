@@ -74,29 +74,44 @@ reconnect them.
 - Windows Settings → *Extend desktop to this display* **does** work, so the
   operation is possible; it enables one specific path rather than a preset.
 
-`DisplayCtl.cs` was an attempt to do what Settings does, via
-`QueryDisplayConfig` / `SetDisplayConfig`. Reading works — `DisplayCtl.exe list`
-correctly enumerates every path including detached ones. Writing does not:
+`DisplayCtl.cs` does what Settings does, via `QueryDisplayConfig` /
+`SetDisplayConfig`. Reading works and the allocator is now correct; applying is
+still blocked.
 
-- `SDC_USE_SUPPLIED_DISPLAY_CONFIG` with the queried modes returns success, but
-  the displays never appear in GDI. `EnumDisplayDevices` shows two screens while
-  the CCD table claims four active paths.
-- Dropping `modeInfoIdx` on the newly enabled paths, `SDC_TOPOLOGY_SUPPLIED` with
-  a null mode array, and omitting `SDC_SAVE_TO_DATABASE` all return
-  `ERROR_INVALID_PARAMETER` (87).
-- Assigning unused `sourceInfo.id` values to newly enabled paths made every
-  variant return 87. Reverted.
+**Confirmed by review and measurement:**
 
-Each monitor exposes several candidate paths (distinct source pairings) and only
-one may be active, so this looks like source-slot allocation — but the working
-combination has not been found. Suggestions welcome.
+- `SDC_VIRTUAL_MODE_AWARE` / `QDC_VIRTUAL_MODE_AWARE` are mandatory here. A
+  `selftest` that validates the *current, unmodified* config returns 0 with
+  `supplied+changes+vma`, and `87` without the virtual-mode flag. Any experiment
+  run without it was meaningless.
+- The earlier `SDC_TOPOLOGY_SUPPLIED` attempt was malformed: that flag requires
+  *every* supplied path to have invalid source and target mode indices, and this
+  code only invalidated the newly-enabled ones. Its 87 was expected.
+- `QDC_ALL_PATHS` returns every source→target combination in priority order, so
+  the first candidate for each monitor is always `src=0`. Activating those gives
+  three targets on one source, which is a **clone group** — the documented way to
+  request cloning. That fully explains the old "four active CCD paths, two GDI
+  screens" symptom: `SetDisplayConfig` was not failing, it was building exactly
+  the clone topology it was handed.
+- Rewriting `sourceInfo.id` to force a free source yields 87. Source→target
+  pairings that Windows did not enumerate are not legal.
 
-Two bugs already found and fixed in that file, for anyone reading it:
-`DISPLAYCONFIG_PATH_SOURCE_INFO` needs its trailing `statusFlags` field or
-`PATH_INFO` marshals as 68 bytes instead of 72 and `QueryDisplayConfig` corrupts
-the heap; and enabling paths one call at a time makes each new path steal a
-source slot from the previous one.
+The tool now reserves sources held by displays it is not rebuilding, then
+searches the enumerated candidate rows for a combination of distinct sources,
+checking each with `SDC_VALIDATE` before applying anything.
 
+**Where it still fails.** On this machine every multi-source topology is
+rejected:
+
+- 3 monitors, all 24 distinct-source combinations → `87`
+- 2 monitors, all 6 combinations → `87`
+- the existing 3-targets-on-`src=0` clone, unmodified → validates `0`
+
+So Windows currently accepts these targets only as a clone group. That is not an
+allocation bug — the search covers the whole space and validates before acting —
+which suggests display-driver state rather than the code. Untested since: whether
+Windows Settings can still extend by hand in this state, and whether a clean boot
+changes it.
 Current workaround: re-attach via Settings, then run `SLOPTOP MODE.bat`, which
 handles everything else.
 

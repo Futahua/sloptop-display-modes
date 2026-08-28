@@ -63,6 +63,7 @@ class Program
             }
         }
 
+        bool failed = false;
         for (uint i = 0; i < count; i++)
         {
             string path = wp.GetMonitorDevicePathAt(i);
@@ -73,8 +74,19 @@ class Program
                 // and also UID strings like UID256 to distinguish duplicate Default_Monitor entries
                 if (path.IndexOf(args[j], StringComparison.OrdinalIgnoreCase) >= 0)
                 {
-                    wp.SetWallpaper(path, args[j + 1]);
-                    Console.WriteLine("Set " + args[j] + " -> " + args[j + 1]);
+                    try
+                    {
+                        wp.SetWallpaper(path, args[j + 1]);
+                        Console.WriteLine("Set " + args[j] + " -> " + args[j + 1]);
+                    }
+                    catch (System.IO.FileNotFoundException)
+                    {
+                        // Explorer can retain a stale monitor path briefly after
+                        // rotation/topology changes. Do not abort assignments for
+                        // the other live displays; the caller retries the pass.
+                        Console.Error.WriteLine("Monitor path changed while setting " + args[j] + "; retrying is safe.");
+                        failed = true;
+                    }
                 }
             }
         }
@@ -84,5 +96,6 @@ class Program
             SystemParametersInfo(SPI_SETDESKWALLPAPER, 0, primaryWallpaper, SPIF_UPDATEINIFILE | SPIF_SENDCHANGE);
             Console.WriteLine("Global wallpaper set to: " + primaryWallpaper);
         }
+        if (failed) Environment.ExitCode = 1;
     }
 }

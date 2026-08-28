@@ -4,10 +4,9 @@ Scripts that switch a Windows 11 desktop between display arrangements — a
 three-monitor desk setup, a virtual-display-only mode streamed to an iPad, and a
 few variants that add a Samsung panel or a laptop screen.
 
-Built around [NirSoft MultiMonitorTool](https://www.nirsoft.net/utils/multi_monitor_tool.html)
-(not redistributed here — download separately into this folder).
-
-**Open problem below.** Review is most useful on that.
+MultiMonitorTool is retained for state reporting. Topology and geometry are
+applied directly through the Windows display APIs because MMT can wedge after a
+topology change while still returning success.
 
 ---
 
@@ -19,7 +18,7 @@ Built around [NirSoft MultiMonitorTool](https://www.nirsoft.net/utils/multi_moni
 | `*.bat` | One-line wrappers: `apply-mode.ps1 -Mode <name>` |
 | `*.cfg` | Saved layouts, written by MultiMonitorTool's GUI |
 | `SetWallpaper.cs` | Per-monitor wallpaper via `IDesktopWallpaper` |
-| `DisplayCtl.cs` | CCD path inspection (`QueryDisplayConfig`) — see open problem |
+| `DisplayCtl.cs` | CCD attach/detach and dynamic geometry |
 | `regenerate-modes.ps1` | Superseded by `apply-mode.ps1`; kept for reference |
 
 Modes: `sloptop`, `ipad`, `samsung`, `ipadmon`, `ipadlap`.
@@ -40,15 +39,13 @@ MacroSilicon EDID) on another. Any script holding a literal monitor ID stops
 working the moment either shifts, and MultiMonitorTool reports success while
 doing nothing. Hence role-based resolution with alias lists in `$RoleAliases`.
 
-**2. `LoadConfig` does not fully restore a layout.** It re-anchors positions on
-whichever monitor it chooses, drops rotation, and drops refresh rate. Config
-files also do not record which display is primary. So each mode applies the cfg,
-then re-asserts primary, then re-asserts each panel's full mode via
-`/SetMonitors` using geometry read back out of that same cfg.
+**2. `LoadConfig` does not fully restore a layout.** Config files are now read
+only as geometry data. `DisplayCtl layout` applies position, size, rotation and
+refresh directly; MultiMonitorTool never applies the layout.
 
-**3. Windows refuses to disable the primary display.** Primary must move to a
-panel that will stay on *before* anything is switched off, or the disable is
-silently refused and everything downstream cascades.
+**3. Disabling the primary needs a fresh anchor.** `DisplayCtl` blanks source
+modes for the surviving paths and assigns fresh clone groups, allowing Windows
+to re-anchor before geometry is applied.
 
 **4. `SetWallpaper --primary` overwrites the primary monitor.** It calls
 `SystemParametersInfo(SPI_SETDESKWALLPAPER)`, which lands last and repaints
@@ -98,22 +95,19 @@ Other things that matter here:
 - Switching off the display that is currently primary is rejected. When
   disabling, blank the source modes of the surviving paths and give them fresh
   clone groups so Windows re-anchors and picks a new primary itself.
-- Detach *after* the layout step. `LoadConfig` / `/SetMonitors` re-materialise the
-  virtual display, so anything switched off earlier comes back.
+- Detach *before* the layout step. Detaching blanks source modes and makes Windows
+  re-anchor the desktop, so geometry must be the final topology operation.
 - Everything is checked with `SDC_VALIDATE` before being applied, and the enable
   path searches candidate source assignments rather than guessing at one.
 
-## Still open: geometry when MultiMonitorTool is wedged
+## Dynamic geometry
 
-Attach/detach no longer depends on MultiMonitorTool. Positions, rotation, refresh
-rate and primary selection still do, and MMT wedges regularly on this build — so
-a round trip currently ends with the right *set* of displays in the wrong
-arrangement, and `apply-mode.ps1` reports the failure.
-
-`DisplayCtl.exe primary <match>` is a first attempt at moving primary via
-`ChangeDisplaySettingsEx` (shift all displays so the target sits at 0,0, with
-`CDS_SET_PRIMARY`). It currently returns `DISP_CHANGE_FAILED` (-1) per display
-while the final commit returns 0, and the primary does not move. Unresolved.
+`CDS_TEST` accepts the requested modes. `CDS_UPDATEREGISTRY` is specifically
+refused on this machine, while `ChangeDisplaySettingsEx` with flags 0 succeeds.
+Layouts are therefore dynamic; every batch switch reapplies them. Windows pins
+the current primary at `(0,0)`, so the script translates each saved layout around
+that display while preserving relative geometry. Changing the primary still
+requires doing it once in Windows Settings.
 ## Notes
 
 - `.cfg` files are machine-specific — monitor IDs, positions, and one panel's

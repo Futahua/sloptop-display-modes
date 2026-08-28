@@ -163,7 +163,12 @@ static class Native
         public uint dmICMMethod, dmICMIntent, dmMediaType, dmDitherType, dmReserved1, dmReserved2, dmPanningWidth, dmPanningHeight;
     }
 
-    public const uint DM_POSITION       = 0x00000020;
+    public const uint DM_POSITION            = 0x00000020;
+    public const uint DM_DISPLAYORIENTATION  = 0x00000080;
+    public const uint DM_BITSPERPEL          = 0x00040000;
+    public const uint DM_PELSWIDTH           = 0x00080000;
+    public const uint DM_PELSHEIGHT          = 0x00100000;
+    public const uint DM_DISPLAYFREQUENCY    = 0x00400000;
     public const int  ENUM_CURRENT      = -1;
     public const uint CDS_UPDATEREGISTRY = 0x00000001;
     public const uint CDS_NORESET        = 0x10000000;
@@ -243,7 +248,7 @@ class Program
     {
         if (args.Length < 1)
         {
-            Console.Error.WriteLine("usage: DisplayCtl.exe list | enable <match>... | disable <match>... [--save]");
+            Console.Error.WriteLine("usage: DisplayCtl.exe list | enable <match>... | disable <match>... [--save] | layout <match>=x,y,w,h,orient,hz ... | primary <match>");
             return 1;
         }
         string cmd = args[0].ToLowerInvariant();
@@ -308,6 +313,65 @@ class Program
             }
             return 0;
         }
+        if (cmd == "layout")
+        {
+            // layout <match>=<x>,<y>,<w>,<h>,<orient>,<hz> ...
+            //
+            // Applied with flags=0 (dynamic). CDS_UPDATEREGISTRY is refused on this
+            // machine - the same fault that wedges MultiMonitorTool also blocks the
+            // registry write - but a dynamic apply still lands, and every mode
+            // switch re-applies the layout anyway so persistence is not needed.
+            var gdiOf = new Dictionary<string,string>(StringComparer.OrdinalIgnoreCase);
+            for (int i = 0; i < numPaths; i++)
+            {
+                if ((paths[i].flags & Native.PATH_ACTIVE) == 0) continue;
+                var sdn = new Native.SOURCE_DEVICE_NAME();
+                sdn.header.type = Native.GET_SOURCE_NAME;
+                sdn.header.size = (uint)Marshal.SizeOf(typeof(Native.SOURCE_DEVICE_NAME));
+                sdn.header.adapterId = paths[i].sourceInfo.adapterId;
+                sdn.header.id = paths[i].sourceInfo.id;
+                if (Native.DisplayConfigGetDeviceInfo(ref sdn) != 0) continue;
+                string dp, fr;
+                if (!TryGetName(paths[i], out dp, out fr)) continue;
+                foreach (var part in dp.Split('#')) if (part.Length > 3 && !gdiOf.ContainsKey(part)) gdiOf[part] = sdn.viewGdiDeviceName;
+                if (!gdiOf.ContainsKey(fr)) gdiOf[fr] = sdn.viewGdiDeviceName;
+            }
+
+            int bad = 0;
+            foreach (var spec in matches)
+            {
+                int eq = spec.IndexOf('=');
+                if (eq < 0) { Console.Error.WriteLine("bad spec: " + spec); bad++; continue; }
+                string key = spec.Substring(0, eq);
+                string[] f = spec.Substring(eq + 1).Split(',');
+                if (f.Length < 6) { Console.Error.WriteLine("bad spec: " + spec); bad++; continue; }
+
+                string dev = null;
+                foreach (var kv in gdiOf) if (kv.Key.IndexOf(key, StringComparison.OrdinalIgnoreCase) >= 0) { dev = kv.Value; break; }
+                if (dev == null) { Console.Error.WriteLine("  " + key + ": not active"); bad++; continue; }
+
+                var dm = new Native.DEVMODE();
+                dm.dmSize = (ushort)Marshal.SizeOf(typeof(Native.DEVMODE));
+                if (Native.EnumDisplaySettings(dev, Native.ENUM_CURRENT, ref dm) == 0)
+                { Console.WriteLine("  " + key + ": EnumDisplaySettings failed"); bad++; continue; }
+
+                dm.dmPositionX = int.Parse(f[0]);
+                dm.dmPositionY = int.Parse(f[1]);
+                dm.dmPelsWidth = uint.Parse(f[2]);
+                dm.dmPelsHeight = uint.Parse(f[3]);
+                dm.dmDisplayOrientation = uint.Parse(f[4]);
+                dm.dmDisplayFrequency = uint.Parse(f[5]);
+                dm.dmFields = Native.DM_POSITION | Native.DM_PELSWIDTH | Native.DM_PELSHEIGHT
+                            | Native.DM_DISPLAYORIENTATION | Native.DM_DISPLAYFREQUENCY | Native.DM_BITSPERPEL;
+
+                int r = Native.ChangeDisplaySettingsEx(dev, ref dm, IntPtr.Zero, 0, IntPtr.Zero);
+                Console.WriteLine("  {0,-9} {1} -> {2}x{3} @{4} orient={5} at {6},{7}  rc={8}",
+                    key, dev, dm.dmPelsWidth, dm.dmPelsHeight, dm.dmDisplayFrequency,
+                    dm.dmDisplayOrientation, dm.dmPositionX, dm.dmPositionY, r);
+                if (r != 0) bad++;
+            }
+            return bad == 0 ? 0 : 1;
+        }
         if (cmd == "primary")
         {
             if (matches.Count != 1) { Console.Error.WriteLine("primary takes exactly one <match>"); return 1; }
@@ -346,16 +410,17 @@ class Program
                 if (Native.EnumDisplaySettings(dev, Native.ENUM_CURRENT, ref dm) == 0) continue;
                 dm.dmPositionX -= dx; dm.dmPositionY -= dy;
                 dm.dmFields = Native.DM_POSITION;
-                uint f = Native.CDS_UPDATEREGISTRY | Native.CDS_NORESET;
-                if (dev == wantDev) f |= Native.CDS_SET_PRIMARY;
+                // CDS_UPDATEREGISTRY is refused on this machine, so apply dynamically.
+                // CDS_SET_PRIMARY still designates the anchor display.
+                uint f = (dev == wantDev) ? Native.CDS_SET_PRIMARY : 0u;
                 int r = Native.ChangeDisplaySettingsEx(dev, ref dm, IntPtr.Zero, f, IntPtr.Zero);
-                if (r != 0) Console.WriteLine("  " + dev + " -> " + r);
+                Console.WriteLine("  " + dev + " -> rc=" + r);
             }
             int commit = Native.ChangeDisplaySettingsEx(IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, 0, IntPtr.Zero);
             Console.WriteLine("commit -> " + commit);
             return commit == 0 ? 0 : 1;
         }
-        if (cmd != "enable" && cmd != "disable" && cmd != "primary")
+        if (cmd != "enable" && cmd != "disable" && cmd != "primary" && cmd != "layout")
         {
             Console.Error.WriteLine("unknown command: " + cmd); return 1;
         }

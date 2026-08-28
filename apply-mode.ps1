@@ -51,9 +51,13 @@ $RefreshOverride = @{ MAIN = 60 }
 
 # Displays that only exist while something is streaming to them. Matched by UID
 # substring for wallpaper only; never enabled or disabled here.
+# NOTE the leading commas. In PowerShell @( @('a','b') ) collapses to a flat
+# two-string array, so $x becomes the STRING 'UID257' and $x[0] is the character
+# 'U' - which splatted "U","I","D",":" into the wallpaper helper. The unary comma
+# forces a real array-of-arrays. ipadlap has two entries so it never collapsed.
 $Extras = @{
-  samsung = @( @('UID257','D:\333\samsung.jpg') )
-  ipadmon = @( @('UID256','D:\333\ipadasmonitor.jpg') )
+  samsung = @( ,@('UID257','D:\333\samsung.jpg') )
+  ipadmon = @( ,@('UID256','D:\333\ipadasmonitor.jpg') )
   ipadlap = @( @('UID256','D:\333\ipadasmonitor.jpg'), @('UID258','D:\333\ipadlaptoasmonitor.png') )
 }
 
@@ -235,18 +239,28 @@ foreach ($role in $m.On) {
   if ($mon -and $mon.Active -and $Wallpaper[$role]) { $wargs += $mon.Short; $wargs += $Wallpaper[$role] }
 }
 if ($Extras[$Mode]) {
+  # Extras are matched by UID substring, and a UID only ever appears in the
+  # wallpaper DEVICE PATH (\\?\DISPLAY#...#UID257#...), never in the MONITOR\...
+  # id MultiMonitorTool reports - so ask the wallpaper helper what it can see.
+  $devicePaths = @()
+  try { $devicePaths = @(& $wall list 2>$null) } catch { }
   foreach ($x in $Extras[$Mode]) {
-    $extraPresent = @($live.Values | Where-Object { $_.Active -and $_.Id -match [regex]::Escape($x[0]) }).Count -gt 0
+    if ($x -isnot [array] -or $x.Count -lt 2) { Write-Host "  WARN: malformed extras entry, skipped" -ForegroundColor Yellow; continue }
+    $extraPresent = @($devicePaths | Where-Object { $_ -match [regex]::Escape($x[0]) }).Count -gt 0
     if ($extraPresent) { $wargs += $x[0]; $wargs += $x[1] }
+    else { Write-Host "  (optional display $($x[0]) not connected - skipping its wallpaper)" }
   }
 }
 if ($wargs.Count) {
   # The desktop-wallpaper COM service can briefly retain a monitor path that
   # vanished during rotation. Give it one refresh/retry before reporting it.
-  for ($wallAttempt = 1; $wallAttempt -le 2; $wallAttempt++) {
+  # Rotating a panel changes its device path, and the COM service can keep
+  # serving the stale one for a few seconds. Let it settle, then retry.
+  Start-Sleep -Seconds 3
+  for ($wallAttempt = 1; $wallAttempt -le 3; $wallAttempt++) {
     & $wall @wargs | Out-Null
     if ($LASTEXITCODE -eq 0) { break }
-    if ($wallAttempt -lt 2) { Start-Sleep -Seconds 2 }
+    if ($wallAttempt -lt 3) { Start-Sleep -Seconds 3 }
   }
   if ($LASTEXITCODE -ne 0) { Write-Host "  WARN: wallpaper helper returned $LASTEXITCODE" -ForegroundColor Yellow }
 }

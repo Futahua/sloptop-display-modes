@@ -105,9 +105,22 @@ Write-Host "=== applying mode: $Mode ===" -ForegroundColor Cyan
 $live = Get-Live
 $missing = @($m.On | Where-Object { -not (Resolve-Role $live $_) })
 if ($missing.Count) {
-  Write-Host "  missing: $($missing -join ', ') - running DisplaySwitch /extend"
-  & "$env:SystemRoot\System32\DisplaySwitch.exe" /extend | Out-Null
-  Start-Sleep -Seconds 9
+  # A detached display exposes no Monitor ID, so MultiMonitorTool cannot see it at
+  # all, and DisplaySwitch /extend will not re-attach these panels. DisplayCtl
+  # re-attaches them through the CCD API, giving each its own source and clone
+  # group - ALL in one call, since separate calls make each new path steal the
+  # source the previous one claimed.
+  $aliases = @()
+  foreach ($role in $missing) { $aliases += $RoleAliases[$role] }
+  Write-Host "  missing: $($missing -join ', ') - re-attaching via DisplayCtl"
+  & (Join-Path $d 'DisplayCtl.exe') enable @aliases
+  if ($LASTEXITCODE -ne 0) {
+    Write-Host "  DisplayCtl could not re-attach; falling back to DisplaySwitch /extend" -ForegroundColor Yellow
+    & "$env:SystemRoot\System32\DisplaySwitch.exe" /extend | Out-Null
+    Start-Sleep -Seconds 9
+  } else {
+    Start-Sleep -Seconds 6
+  }
   $live = Get-Live
 }
 
@@ -142,15 +155,6 @@ if ($Mode -eq 'ipad' -and $primaryMon) {
   Start-Sleep -Seconds 3
 }
 
-$live = Get-Live
-foreach ($role in $m.Off) {
-  $mon = Resolve-Role $live $role
-  if ($mon -and $mon.Active) {
-    & $mmt /disable $mon.Id | Out-Null
-    Start-Sleep -Seconds 4
-  }
-}
-
 # --- 4. layout ----------------------------------------------------------------
 if ($m.Cfg) {
   & $mmt /LoadConfig (Join-Path $d $m.Cfg) | Out-Null
@@ -177,6 +181,23 @@ if ($m.Cfg) {
   if ($specs.Count) { & $mmt /SetMonitors @specs | Out-Null; Start-Sleep -Seconds 5 }
 }
 
+# Detach AFTER the layout step, not before. LoadConfig/SetMonitors re-materialise
+# the virtual display, so anything switched off earlier comes straight back.# Detach through DisplayCtl. MultiMonitorTool's /disable only works while it is
+# responsive, and it tends to wedge right after a topology change. Loop until it
+# converges: detaching one display can make Windows re-materialise another, so a
+# single pass leaves stragglers on.
+for ($pass = 1; $pass -le 4; $pass++) {
+  $live = Get-Live
+  $offNow = @()
+  foreach ($role in $m.Off) {
+    $mon = Resolve-Role $live $role
+    if ($mon -and $mon.Active) { $offNow += $mon.Short }
+  }
+  if (-not $offNow.Count) { break }
+  Write-Host "  detach pass $pass : $($offNow -join ', ')"
+  & (Join-Path $d 'DisplayCtl.exe') disable @offNow | Out-Null
+  Start-Sleep -Seconds 5
+}
 # --- 5. wallpaper -------------------------------------------------------------
 # One pass, no --primary: every monitor is named, so the global SPI repaint has
 # nothing to fall back for, and it would land last and overwrite the primary.

@@ -62,59 +62,58 @@ and it does not recover on its own — something must change in Windows display
 settings first. `apply-mode.ps1` therefore verifies its own result and reports
 the failure explicitly instead of trusting exit codes.
 
-## Open problem: re-attaching a detached display
+## Attaching and detaching displays (solved)
 
-`ipad` mode disconnects the three physical panels. Nothing here can reliably
-reconnect them.
+`ipad` mode detaches the physical panels. Neither `DisplaySwitch.exe /extend` nor
+MultiMonitorTool `/enable` can bring them back — a detached display exposes no
+Monitor ID, so MMT cannot address it at all. `DisplayCtl.exe` does it through the
+CCD API, and `apply-mode.ps1` calls it for both directions.
 
-- `DisplaySwitch.exe /extend` does not re-attach them (tested to 35s). It applies
-  a blanket topology; these paths stay detached.
-- MultiMonitorTool `/enable` cannot address them — a detached display exposes no
-  Monitor ID, so there is nothing to match on.
-- Windows Settings → *Extend desktop to this display* **does** work, so the
-  operation is possible; it enables one specific path rather than a preset.
+The piece that made it work: **under `SDC_VIRTUAL_MODE_AWARE` the source
+`modeInfoIdx` is packed** — high 16 bits `sourceModeInfoIdx`, low 16 bits
+`cloneGroupId`. Writing `0xffffffff` therefore does not mean "no mode", it means
+no source mode *and no clone-group identity*. With no source mode supplied,
+`cloneGroupId` is the only thing telling Windows how paths group into desktops,
+so every independently extended display needs its own group:
 
-`DisplayCtl.cs` does what Settings does, via `QueryDisplayConfig` /
-`SetDisplayConfig`. Reading works and the allocator is now correct; applying is
-still blocked.
+```csharp
+source.modeInfoIdx = (SOURCE_MODE_INVALID << 16) | (cloneGroup & 0xffff);
+```
 
-**Confirmed by review and measurement:**
+With distinct clone groups the topology validates on the first attempt. Without
+them every multi-source arrangement is rejected with 87 — which had looked like
+"the driver refuses multi-source topology" and was nothing of the kind.
 
-- `SDC_VIRTUAL_MODE_AWARE` / `QDC_VIRTUAL_MODE_AWARE` are mandatory here. A
-  `selftest` that validates the *current, unmodified* config returns 0 with
-  `supplied+changes+vma`, and `87` without the virtual-mode flag. Any experiment
-  run without it was meaningless.
-- The earlier `SDC_TOPOLOGY_SUPPLIED` attempt was malformed: that flag requires
-  *every* supplied path to have invalid source and target mode indices, and this
-  code only invalidated the newly-enabled ones. Its 87 was expected.
-- `QDC_ALL_PATHS` returns every source→target combination in priority order, so
-  the first candidate for each monitor is always `src=0`. Activating those gives
-  three targets on one source, which is a **clone group** — the documented way to
-  request cloning. That fully explains the old "four active CCD paths, two GDI
-  screens" symptom: `SetDisplayConfig` was not failing, it was building exactly
-  the clone topology it was handed.
-- Rewriting `sourceInfo.id` to force a free source yields 87. Source→target
-  pairings that Windows did not enumerate are not legal.
+Other things that matter here:
 
-The tool now reserves sources held by displays it is not rebuilding, then
-searches the enumerated candidate rows for a combination of distinct sources,
-checking each with `SDC_VALIDATE` before applying anything.
+- `QDC_VIRTUAL_MODE_AWARE` / `SDC_VIRTUAL_MODE_AWARE` are mandatory. A `selftest`
+  validating the *current, unmodified* config returns 0 with them and 87 without,
+  so any experiment omitting them is uninterpretable.
+- `QDC_ALL_PATHS` returns all source→target combinations in priority order, so
+  activating the first candidate per monitor puts them all on source 0 — a clone
+  group. That produced the "four active CCD paths, two GDI screens" symptom:
+  `SetDisplayConfig` was building exactly what it was asked for.
+- Enable every target in ONE call. Separate calls make each new path claim the
+  source the previous one just took.
+- Switching off the display that is currently primary is rejected. When
+  disabling, blank the source modes of the surviving paths and give them fresh
+  clone groups so Windows re-anchors and picks a new primary itself.
+- Detach *after* the layout step. `LoadConfig` / `/SetMonitors` re-materialise the
+  virtual display, so anything switched off earlier comes back.
+- Everything is checked with `SDC_VALIDATE` before being applied, and the enable
+  path searches candidate source assignments rather than guessing at one.
 
-**Where it still fails.** On this machine every multi-source topology is
-rejected:
+## Still open: geometry when MultiMonitorTool is wedged
 
-- 3 monitors, all 24 distinct-source combinations → `87`
-- 2 monitors, all 6 combinations → `87`
-- the existing 3-targets-on-`src=0` clone, unmodified → validates `0`
+Attach/detach no longer depends on MultiMonitorTool. Positions, rotation, refresh
+rate and primary selection still do, and MMT wedges regularly on this build — so
+a round trip currently ends with the right *set* of displays in the wrong
+arrangement, and `apply-mode.ps1` reports the failure.
 
-So Windows currently accepts these targets only as a clone group. That is not an
-allocation bug — the search covers the whole space and validates before acting —
-which suggests display-driver state rather than the code. Untested since: whether
-Windows Settings can still extend by hand in this state, and whether a clean boot
-changes it.
-Current workaround: re-attach via Settings, then run `SLOPTOP MODE.bat`, which
-handles everything else.
-
+`DisplayCtl.exe primary <match>` is a first attempt at moving primary via
+`ChangeDisplaySettingsEx` (shift all displays so the target sits at 0,0, with
+`CDS_SET_PRIMARY`). It currently returns `DISP_CHANGE_FAILED` (-1) per display
+while the final commit returns 0, and the primary does not move. Unresolved.
 ## Notes
 
 - `.cfg` files are machine-specific — monitor IDs, positions, and one panel's

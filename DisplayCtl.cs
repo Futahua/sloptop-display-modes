@@ -138,6 +138,49 @@ static class Native
     public static extern int SetDisplayConfig(uint numPaths, [In] PATH_INFO[] paths,
         uint numModes, [In] MODE_INFO[] modes, uint flags);
 
+    // Source -> GDI device name (\\.\DISPLAYn), needed to drive ChangeDisplaySettingsEx.
+    public const uint GET_SOURCE_NAME = 1;
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    public struct SOURCE_DEVICE_NAME
+    {
+        public DEVICE_INFO_HEADER header;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string viewGdiDeviceName;
+    }
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    public struct DEVMODE
+    {
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string dmDeviceName;
+        public ushort dmSpecVersion, dmDriverVersion, dmSize, dmDriverExtra;
+        public uint dmFields;
+        public int dmPositionX, dmPositionY;
+        public uint dmDisplayOrientation, dmDisplayFixedOutput;
+        public short dmColor, dmDuplex, dmYResolution, dmTTOption, dmCollate;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string dmFormName;
+        public ushort dmLogPixels;
+        public uint dmBitsPerPel, dmPelsWidth, dmPelsHeight, dmDisplayFlags, dmDisplayFrequency;
+        public uint dmICMMethod, dmICMIntent, dmMediaType, dmDitherType, dmReserved1, dmReserved2, dmPanningWidth, dmPanningHeight;
+    }
+
+    public const uint DM_POSITION       = 0x00000020;
+    public const int  ENUM_CURRENT      = -1;
+    public const uint CDS_UPDATEREGISTRY = 0x00000001;
+    public const uint CDS_NORESET        = 0x10000000;
+    public const uint CDS_SET_PRIMARY    = 0x00000010;
+
+    [DllImport("user32.dll")]
+    public static extern int DisplayConfigGetDeviceInfo(ref SOURCE_DEVICE_NAME deviceName);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    public static extern int EnumDisplaySettings(string deviceName, int modeNum, ref DEVMODE dm);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    public static extern int ChangeDisplaySettingsEx(string deviceName, ref DEVMODE dm, IntPtr hwnd, uint flags, IntPtr param);
+
+    [DllImport("user32.dll")]
+    public static extern int ChangeDisplaySettingsEx(IntPtr deviceName, IntPtr dm, IntPtr hwnd, uint flags, IntPtr param);
+
     [DllImport("user32.dll")]
     public static extern int DisplayConfigGetDeviceInfo(ref TARGET_DEVICE_NAME deviceName);
 }
@@ -160,6 +203,25 @@ class Program
         return true;
     }
 
+    // Under SDC_VIRTUAL_MODE_AWARE the source modeInfoIdx is PACKED:
+    //   high 16 bits = sourceModeInfoIdx, low 16 bits = cloneGroupId
+    // So writing 0xffffffff does not mean "no mode" - it means no source mode AND
+    // no clone-group identity. With no source mode supplied, cloneGroupId is the
+    // only thing telling Windows how paths group into desktops, and every
+    // independently extended display needs its OWN group. Leaving it invalid is
+    // why a multi-source topology was rejected with 87.
+    const uint SOURCE_MODE_INVALID = 0xffff;
+    const uint CLONE_GROUP_INVALID = 0xffff;
+
+    static void SetSourceWithoutMode(ref Native.PATH_SOURCE_INFO source, uint cloneGroup)
+    {
+        source.modeInfoIdx = (SOURCE_MODE_INVALID << 16) | (cloneGroup & 0xffff);
+    }
+
+    static uint CloneGroupOf(Native.PATH_SOURCE_INFO source)
+    {
+        return source.modeInfoIdx & 0xffff;
+    }
     // A source belongs to one adapter, so the adapter LUID is part of its identity.
     static string SourceKey(Native.PATH_INFO p)
     {
@@ -246,7 +308,54 @@ class Program
             }
             return 0;
         }
-        if (cmd != "enable" && cmd != "disable")
+        if (cmd == "primary")
+        {
+            if (matches.Count != 1) { Console.Error.WriteLine("primary takes exactly one <match>"); return 1; }
+            // Find the active path for this monitor and translate its source into
+            // the GDI device name, then make it primary with ChangeDisplaySettingsEx.
+            // Windows defines the primary as the display at (0,0), so every other
+            // display shifts by the same delta.
+            string wantDev = null;
+            var devs = new List<string>();
+            for (int i = 0; i < numPaths; i++)
+            {
+                if ((paths[i].flags & Native.PATH_ACTIVE) == 0) continue;
+                var sdn = new Native.SOURCE_DEVICE_NAME();
+                sdn.header.type = Native.GET_SOURCE_NAME;
+                sdn.header.size = (uint)Marshal.SizeOf(typeof(Native.SOURCE_DEVICE_NAME));
+                sdn.header.adapterId = paths[i].sourceInfo.adapterId;
+                sdn.header.id = paths[i].sourceInfo.id;
+                if (Native.DisplayConfigGetDeviceInfo(ref sdn) != 0) continue;
+                string gdi = sdn.viewGdiDeviceName;
+                if (!devs.Contains(gdi)) devs.Add(gdi);
+                string dp, fr;
+                if (!TryGetName(paths[i], out dp, out fr)) continue;
+                if (Matches(dp, fr, matches)) wantDev = gdi;
+            }
+            if (wantDev == null) { Console.Error.WriteLine("no active display matched"); return 1; }
+
+            var target = new Native.DEVMODE(); target.dmSize = (ushort)Marshal.SizeOf(typeof(Native.DEVMODE));
+            if (Native.EnumDisplaySettings(wantDev, Native.ENUM_CURRENT, ref target) == 0)
+            { Console.Error.WriteLine("EnumDisplaySettings failed for " + wantDev); return 1; }
+            int dx = target.dmPositionX, dy = target.dmPositionY;
+            Console.WriteLine("making {0} primary (shifting all by {1},{2})", wantDev, -dx, -dy);
+
+            foreach (string dev in devs)
+            {
+                var dm = new Native.DEVMODE(); dm.dmSize = (ushort)Marshal.SizeOf(typeof(Native.DEVMODE));
+                if (Native.EnumDisplaySettings(dev, Native.ENUM_CURRENT, ref dm) == 0) continue;
+                dm.dmPositionX -= dx; dm.dmPositionY -= dy;
+                dm.dmFields = Native.DM_POSITION;
+                uint f = Native.CDS_UPDATEREGISTRY | Native.CDS_NORESET;
+                if (dev == wantDev) f |= Native.CDS_SET_PRIMARY;
+                int r = Native.ChangeDisplaySettingsEx(dev, ref dm, IntPtr.Zero, f, IntPtr.Zero);
+                if (r != 0) Console.WriteLine("  " + dev + " -> " + r);
+            }
+            int commit = Native.ChangeDisplaySettingsEx(IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, 0, IntPtr.Zero);
+            Console.WriteLine("commit -> " + commit);
+            return commit == 0 ? 0 : 1;
+        }
+        if (cmd != "enable" && cmd != "disable" && cmd != "primary")
         {
             Console.Error.WriteLine("unknown command: " + cmd); return 1;
         }
@@ -274,6 +383,20 @@ class Program
                 Console.WriteLine("disabling src={0} tgt={1} {2}", paths[i].sourceInfo.id, paths[i].targetInfo.id, fr);
             }
             if (changes == 0) { Console.WriteLine("nothing to change"); return 0; }
+
+            // If we just switched off the display that was primary, the remaining
+            // topology has no anchor and validation fails. Blank the source modes
+            // of every surviving path and hand each a fresh clone group, so Windows
+            // recomputes the desktop and picks a new primary itself. Geometry is
+            // re-applied afterwards by the caller.
+            uint grp = 0;
+            for (int i = 0; i < numPaths; i++)
+            {
+                if ((paths[i].flags & Native.PATH_ACTIVE) == 0) continue;
+                SetSourceWithoutMode(ref paths[i].sourceInfo, grp++);
+                paths[i].targetInfo.modeInfoIdx = Native.MODE_IDX_INVALID;
+            }
+
             int drc = Native.SetDisplayConfig(numPaths, paths, numModes, modes, Native.SDC_VALIDATE | supplied);
             Console.WriteLine("validate -> " + drc);
             if (drc != 0) { Console.Error.WriteLine("rejected; nothing applied"); return 1; }
@@ -329,6 +452,25 @@ class Program
             if (Matches(dp, fr, matches)) baseline[i].flags &= ~Native.PATH_ACTIVE;
         }
 
+        // Clone groups already spoken for by displays we are not rebuilding (the
+        // virtual display keeps its own), so the new ones do not collide.
+        var usedGroups = new HashSet<uint>();
+        for (int i = 0; i < numPaths; i++)
+        {
+            if ((baseline[i].flags & Native.PATH_ACTIVE) == 0) continue;
+            uint g = CloneGroupOf(baseline[i].sourceInfo);
+            if (g != CLONE_GROUP_INVALID) usedGroups.Add(g);
+        }
+        var cloneGroups = new uint[targetOrder.Count];
+        uint nextGroup = 0;
+        for (int k = 0; k < cloneGroups.Length; k++)
+        {
+            while (usedGroups.Contains(nextGroup)) nextGroup++;
+            cloneGroups[k] = nextGroup;
+            usedGroups.Add(nextGroup);
+        }
+        Console.WriteLine("clone groups: " + string.Join(", ", Array.ConvertAll(cloneGroups, delegate(uint g) { return g.ToString(); })));
+
         int[] pick = new int[targetOrder.Count];
         int attempts = 0;
         Native.PATH_INFO[] winner = null;
@@ -343,7 +485,8 @@ class Program
                 {
                     int idx = pick[k];
                     cand[idx].flags |= Native.PATH_ACTIVE;
-                    cand[idx].sourceInfo.modeInfoIdx = Native.MODE_IDX_INVALID;
+                    // Distinct clone group per display = independent desktops.
+                    SetSourceWithoutMode(ref cand[idx].sourceInfo, cloneGroups[k]);
                     cand[idx].targetInfo.modeInfoIdx = Native.MODE_IDX_INVALID;
                 }
                 attempts++;

@@ -1,0 +1,16 @@
+# Third-party: NirSoft MultiMonitorTool, redistributed under its own terms.
+MultiMonitorTool.exe
+MultiMonitorTool.chm
+MultiMonitorTool.cfg
+readme.txt
+files.zip
+
+# Build outputs - sources are tracked, binaries are not.
+SetWallpaper.exe
+DisplayCtl.exe
+
+# Local snapshots taken while debugging.
+_backup-predell/
+*.orig-backup
+*.midchaos-backup
+mode.state

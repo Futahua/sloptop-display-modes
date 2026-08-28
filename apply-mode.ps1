@@ -58,12 +58,12 @@ $Extras = @{
 }
 
 $Modes = @{
-  sloptop = @{ Cfg='3_monitors.cfg';          On=@('MAIN','LOWER','PORTRAIT'); Off=@('VDD') }
-  samsung = @{ Cfg='samsungasmonitor.cfg';    On=@('MAIN','LOWER','PORTRAIT'); Off=@('VDD') }
-  ipadmon = @{ Cfg='ipadasmonitor.cfg';       On=@('MAIN','LOWER','PORTRAIT'); Off=@('VDD') }
-  ipadlap = @{ Cfg='ipadlaptopasmonitor.cfg'; On=@('MAIN','LOWER','PORTRAIT'); Off=@('VDD') }
+  sloptop = @{ Cfg='3_monitors.cfg';          On=@('MAIN','LOWER','PORTRAIT'); Off=@('VDD'); Primary='LOWER' }
+  samsung = @{ Cfg='samsungasmonitor.cfg';    On=@('MAIN','LOWER','PORTRAIT'); Off=@('VDD'); Primary='LOWER' }
+  ipadmon = @{ Cfg='ipadasmonitor.cfg';       On=@('MAIN','LOWER','PORTRAIT'); Off=@('VDD'); Primary='MAIN' }
+  ipadlap = @{ Cfg='ipadlaptopasmonitor.cfg'; On=@('MAIN','LOWER','PORTRAIT'); Off=@('VDD'); Primary='LOWER' }
   # No cfg for ipad - one display, fixed geometry.
-  ipad    = @{ Cfg=$null; On=@('VDD'); Off=@('MAIN','LOWER','PORTRAIT')
+  ipad    = @{ Cfg=$null; On=@('VDD'); Off=@('MAIN','LOWER','PORTRAIT'); Primary='VDD'
                Fixed = @{ VDD = @{ X=0; Y=0; W=1366; H=768; Orient=0; Hz=60 } } }
 }
 
@@ -154,7 +154,19 @@ for ($pass = 1; $pass -le 4; $pass++) {
   Start-Sleep -Seconds 5
 }
 
-# --- 3. geometry --------------------------------------------------------------
+# --- 3. primary ---------------------------------------------------------------
+# Windows may choose a different primary when the prior one is detached. MMT's
+# geometry operations wedge on this build, but SetPrimary is reliable after the
+# topology has settled and is the one operation that can persist the selection.
+$live = Get-Live
+$primaryMon = Resolve-Role $live $m.Primary
+if ($primaryMon -and -not $primaryMon.Primary) {
+  Write-Host "  setting primary: $($m.Primary)"
+  & $mmt /SetPrimary $primaryMon.Id | Out-Null
+  Start-Sleep -Seconds 4
+}
+
+# --- 4. geometry --------------------------------------------------------------
 # Positions, size, rotation and refresh via DisplayCtl (ChangeDisplaySettingsEx,
 # applied dynamically). MultiMonitorTool's LoadConfig/SetMonitors are not used:
 # they no-op whenever it is wedged, and LoadConfig re-materialises the virtual
@@ -213,7 +225,7 @@ if ($want.Count) {
   }
 }
 
-# --- 4. wallpaper -------------------------------------------------------------
+# --- 5. wallpaper -------------------------------------------------------------
 # One pass, no --primary: every monitor is named, so the global SPI repaint has
 # nothing to fall back for, and it would land last and overwrite the primary.
 $live = Get-Live
@@ -239,7 +251,7 @@ if ($wargs.Count) {
   if ($LASTEXITCODE -ne 0) { Write-Host "  WARN: wallpaper helper returned $LASTEXITCODE" -ForegroundColor Yellow }
 }
 
-# --- 5. report ----------------------------------------------------------------
+# --- 6. report ----------------------------------------------------------------
 # Everything here can fail silently, so verify against what was asked for.
 $live = Get-Live
 Write-Host ""
@@ -271,6 +283,10 @@ foreach ($role in $RoleAliases.Keys) {
   }
   $pri = if ($mon.Primary) { ' PRIMARY' } else { '' }
   Write-Host ("  {0,-9} {1,-3} {2,-11} {3}{4}{5}" -f $role, $got, $mon.Res, $mon.Pos, $pri, $flag)
+}
+if ($primaryMon -and -not (Resolve-Role $live $m.Primary).Primary) {
+  Write-Host "  $($m.Primary) is not primary  <-- WANTED PRIMARY" -ForegroundColor Red
+  $ok = $false
 }
 Write-Host ""
 if ($ok) {

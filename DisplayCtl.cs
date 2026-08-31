@@ -244,6 +244,28 @@ class Program
         return false;
     }
 
+    // Highest refresh this device supports at the given resolution. Modes are
+    // enumerated in the panel's native orientation, so a rotated target (1080x1920)
+    // has to match the 1920x1080 mode too - hence the swapped comparison.
+    static uint BestRefresh(string dev, uint w, uint h, out string tried)
+    {
+        uint best = 0;
+        var seen = new List<uint>();
+        var dm = new Native.DEVMODE();
+        dm.dmSize = (ushort)Marshal.SizeOf(typeof(Native.DEVMODE));
+        for (int i = 0; Native.EnumDisplaySettings(dev, i, ref dm) != 0; i++)
+        {
+            bool match = (dm.dmPelsWidth == w && dm.dmPelsHeight == h)
+                      || (dm.dmPelsWidth == h && dm.dmPelsHeight == w);
+            if (!match) continue;
+            if (!seen.Contains(dm.dmDisplayFrequency)) seen.Add(dm.dmDisplayFrequency);
+            if (dm.dmDisplayFrequency > best) best = dm.dmDisplayFrequency;
+            dm.dmSize = (ushort)Marshal.SizeOf(typeof(Native.DEVMODE));
+        }
+        seen.Sort();
+        tried = string.Join("/", seen.ConvertAll(delegate(uint v) { return v.ToString(); }).ToArray());
+        return best;
+    }
     static int Main(string[] args)
     {
         if (args.Length < 1)
@@ -313,6 +335,32 @@ class Program
             }
             return 0;
         }
+        if (cmd == "modes")
+        {
+            for (int i = 0; i < numPaths; i++)
+            {
+                if ((paths[i].flags & Native.PATH_ACTIVE) == 0) continue;
+                var sdn = new Native.SOURCE_DEVICE_NAME();
+                sdn.header.type = Native.GET_SOURCE_NAME;
+                sdn.header.size = (uint)Marshal.SizeOf(typeof(Native.SOURCE_DEVICE_NAME));
+                sdn.header.adapterId = paths[i].sourceInfo.adapterId;
+                sdn.header.id = paths[i].sourceInfo.id;
+                if (Native.DisplayConfigGetDeviceInfo(ref sdn) != 0) continue;
+                string dp, fr;
+                if (!TryGetName(paths[i], out dp, out fr)) continue;
+                if (matches.Count > 0 && !Matches(dp, fr, matches)) continue;
+
+                var cur = new Native.DEVMODE();
+                cur.dmSize = (ushort)Marshal.SizeOf(typeof(Native.DEVMODE));
+                if (Native.EnumDisplaySettings(sdn.viewGdiDeviceName, Native.ENUM_CURRENT, ref cur) == 0) continue;
+                string avail;
+                uint best = BestRefresh(sdn.viewGdiDeviceName, cur.dmPelsWidth, cur.dmPelsHeight, out avail);
+                Console.WriteLine("{0,-14} {1,-12} {2}x{3} now {4}Hz  max {5}Hz  available: {6}",
+                    fr, sdn.viewGdiDeviceName, cur.dmPelsWidth, cur.dmPelsHeight,
+                    cur.dmDisplayFrequency, best, avail);
+            }
+            return 0;
+        }
         if (cmd == "layout")
         {
             // layout <match>=<x>,<y>,<w>,<h>,<orient>,<hz> ...
@@ -360,7 +408,15 @@ class Program
                 dm.dmPelsWidth = uint.Parse(f[2]);
                 dm.dmPelsHeight = uint.Parse(f[3]);
                 dm.dmDisplayOrientation = uint.Parse(f[4]);
-                dm.dmDisplayFrequency = uint.Parse(f[5]);
+                string hzField = f[5].Trim();
+                if (hzField.Equals("max", StringComparison.OrdinalIgnoreCase) || hzField == "0")
+                {
+                    string avail;
+                    uint best = BestRefresh(dev, dm.dmPelsWidth, dm.dmPelsHeight, out avail);
+                    if (best == 0) { Console.WriteLine("  " + key + ": no modes enumerated, keeping " + dm.dmDisplayFrequency + "Hz"); }
+                    else { dm.dmDisplayFrequency = best; Console.WriteLine("  " + key + ": max refresh " + best + "Hz (available: " + avail + ")"); }
+                }
+                else dm.dmDisplayFrequency = uint.Parse(hzField);
                 dm.dmFields = Native.DM_POSITION | Native.DM_PELSWIDTH | Native.DM_PELSHEIGHT
                             | Native.DM_DISPLAYORIENTATION | Native.DM_DISPLAYFREQUENCY | Native.DM_BITSPERPEL;
 
@@ -420,7 +476,7 @@ class Program
             Console.WriteLine("commit -> " + commit);
             return commit == 0 ? 0 : 1;
         }
-        if (cmd != "enable" && cmd != "disable" && cmd != "primary" && cmd != "layout")
+        if (cmd != "enable" && cmd != "disable" && cmd != "primary" && cmd != "layout" && cmd != "modes")
         {
             Console.Error.WriteLine("unknown command: " + cmd); return 1;
         }

@@ -108,6 +108,49 @@ Layouts are therefore dynamic; every batch switch reapplies them. Windows pins
 the current primary at `(0,0)`, so the script translates each saved layout around
 that display while preserving relative geometry. Changing the primary still
 requires doing it once in Windows Settings.
+## Refresh rates
+
+Every display runs at the highest refresh it reports for its current resolution.
+`DisplayCtl` enumerates the supported modes and picks the maximum rather than
+trusting the rate saved in a cfg — a saved rate goes stale as soon as a link
+renegotiates, and then either fails to apply or silently caps a panel below its
+ceiling. `DisplayCtl.exe modes` shows what each panel offers.
+
+`$RefreshPin` in `apply-mode.ps1` holds a role *below* its maximum. Only `VDD` is
+pinned, to 60: it is streamed over the network to the iPad, so a higher rate
+costs bandwidth and encoding for no visible benefit.
+
+Note that modes are enumerated in the panel's native orientation, so a rotated
+target (1080x1920) has to be matched against the 1920x1080 mode as well.
+
+## Positions do not survive a reboot
+
+`CDS_UPDATEREGISTRY` is refused on this machine, so positions are applied
+dynamically only. Orientation, resolution and primary *are* stored by Windows,
+which is why a fresh boot has those right and lays the monitors out in a
+default three-in-a-row strip.
+
+A scheduled task, `SlopTop display layout`, re-applies sloptop 25 seconds after
+logon via `logon-layout.ps1`. The delay lets the GPU finish enumerating panels;
+positioning them before that yields a half-applied layout.
+
+It always applies sloptop, never ipad, even if the machine was in ipad mode when
+it shut down — at logon there may be no iPad attached to receive the virtual
+display, and a virtual-display-only desktop would leave every physical panel dark
+with no way to see anything. It then rewrites `mode.state` to `slop`, because
+`TOGGLE MODE.bat` reads that file to choose direction and would otherwise need
+two presses to reach ipad mode.
+
+Remove it with:
+
+```powershell
+Unregister-ScheduledTask -TaskName "SlopTop display layout" -Confirm:$false
+```
+
+The durable alternative, not yet attempted: build explicit
+`DISPLAYCONFIG_SOURCE_MODE` records carrying each position and apply them with
+`SetDisplayConfig` + `SDC_SAVE_TO_DATABASE`, the path Windows Settings itself
+uses. That would persist without anything running at logon.
 ## Notes
 
 - `.cfg` files are machine-specific — monitor IDs, positions, and one panel's

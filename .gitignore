@@ -14,3 +14,6 @@ _backup-predell/
 *.orig-backup
 *.midchaos-backup
 mode.state
+
+# Written by the logon task at runtime.
+logon-layout.log

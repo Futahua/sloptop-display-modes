@@ -44,10 +44,11 @@ $Wallpaper = @{
   VDD      = 'D:\333\ipad.png'
 }
 
-# The new Edra's saved streaming-mode configs predate its port change and ask
-# for 120 Hz. The current link only negotiates 60 Hz; keep every batch usable
-# until the cable/port issue is fixed, then remove this override.
-$RefreshOverride = @{ MAIN = 60 }
+# Every display runs at the highest refresh it reports for its resolution.
+# Add a role here to deliberately hold one BELOW its maximum.
+# VDD is pinned: it is streamed over the network to the iPad, so refresh above
+# 60 costs bandwidth and encoding effort for no visible benefit.
+$RefreshPin = @{ VDD = 60 }
 
 # Displays that only exist while something is streaming to them. Matched by UID
 # substring for wallpaper only; never enabled or disabled here.
@@ -68,7 +69,7 @@ $Modes = @{
   ipadlap = @{ Cfg='ipadlaptopasmonitor.cfg'; On=@('MAIN','LOWER','PORTRAIT'); Off=@('VDD'); Primary='LOWER' }
   # No cfg for ipad - one display, fixed geometry.
   ipad    = @{ Cfg=$null; On=@('VDD'); Off=@('MAIN','LOWER','PORTRAIT'); Primary='VDD'
-               Fixed = @{ VDD = @{ X=0; Y=0; W=1366; H=768; Orient=0; Hz=60 } } }
+               Fixed = @{ VDD = @{ X=0; Y=0; W=1366; H=768; Orient=0; Hz='max' } } }
 }
 
 function Get-Live {
@@ -184,12 +185,21 @@ if ($m.Cfg) {
     $e = Get-CfgEntry $cfg $role
     if (-not $e) { Write-Host "  WARN: no $role entry in $($m.Cfg)" -ForegroundColor Yellow; continue }
     if ([int]$e.Width -le 0) { continue }
+    # Hz comes from the cfg only when a mode deliberately pins one. Otherwise ask
+    # for 'max' and let DisplayCtl enumerate what the panel actually supports at
+    # this resolution - saved configs go stale when a link renegotiates, and a
+    # hardcoded rate then either fails or silently caps a panel below its ceiling.
     $want[$role] = @{ X=[int]$e.PositionX; Y=[int]$e.PositionY; W=[int]$e.Width; H=[int]$e.Height
-                      Orient=[int]$e.DisplayOrientation; Hz=[int]$e.DisplayFrequency }
-    if ($RefreshOverride.ContainsKey($role)) { $want[$role].Hz = $RefreshOverride[$role] }
+                      Orient=[int]$e.DisplayOrientation; Hz='max' }
+    if ($RefreshPin.ContainsKey($role)) { $want[$role].Hz = $RefreshPin[$role] }
   }
 } elseif ($m.Fixed) {
-  foreach ($k in $m.Fixed.Keys) { $want[$k] = $m.Fixed[$k] }
+  foreach ($k in $m.Fixed.Keys) {
+    # Clone the literal, so applying a pin does not mutate the mode table itself.
+    $f = @{}; foreach ($kk in $m.Fixed[$k].Keys) { $f[$kk] = $m.Fixed[$k][$kk] }
+    if ($RefreshPin.ContainsKey($k)) { $f.Hz = $RefreshPin[$k] }
+    $want[$k] = $f
+  }
 }
 
 if ($want.Count) {
@@ -285,11 +295,16 @@ foreach ($role in $RoleAliases.Keys) {
     if ($mon.Pos -match '^\s*(-?\d+)\s*,\s*(-?\d+)\s*$') { $actualX = [int]$matches[1]; $actualY = [int]$matches[2] }
     $actualW = $null; $actualH = $null
     if ($mon.Res -match '^\s*(\d+)\s+X\s+(\d+)\s*$') { $actualW = [int]$matches[1]; $actualH = [int]$matches[2] }
+    # 'max' means "whatever this panel tops out at", which is only known after
+    # DisplayCtl enumerates it - so there is no number to compare against here.
+    # Comparing the literal string would fail every time.
+    $hzBad = $false
+    if ($expected.Hz -ne 'max') { $hzBad = ($mon.Frequency -ne [int]$expected.Hz) }
     # Windows occasionally rounds a touching edge by one pixel after rotation.
     $geometryBad = ($null -eq $actualX) -or ($null -eq $actualW) -or
       ([math]::Abs($actualX - $expectedX) -gt 1) -or ([math]::Abs($actualY - $expectedY) -gt 1) -or
       ($actualW -ne $expected.W) -or ($actualH -ne $expected.H) -or
-      ($mon.Frequency -ne $expected.Hz) -or ($mon.Orientation -ne $expected.Orient)
+      $hzBad -or ($mon.Orientation -ne $expected.Orient)
     if ($geometryBad) {
       $flag += "  <-- WANTED $($expected.W)x$($expected.H) @$($expected.Hz) orient=$($expected.Orient) at $expectedX,$expectedY"
       $ok = $false

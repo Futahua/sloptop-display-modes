@@ -33,7 +33,13 @@ $tmp  = Join-Path $env:TEMP "mmt-state-$PID.txt"
 $RoleAliases = [ordered]@{
   MAIN     = @('SAC2453')            # new Edra, the top panel
   LOWER    = @('EDR2380')            # older Edra, below
-  PORTRAIT = @('AOC2269','HJW9291')  # AOC, rotated; identity varies by port
+  # AOC, rotated. It reaches the GPU through an HDMI converter whose EDID
+  # passthrough is unreliable, so it has enumerated under three different
+  # identities so far: its own (AOC2269), and two converter chipsets
+  # (HJW9291 = MacroSilicon, FME7210/TS35505). When it presents a converter
+  # identity the mode list degrades too - 1024x768 only. Add any new identity
+  # here; the symptom is PORTRAIT reported "absent" while the panel is lit.
+  PORTRAIT = @('AOC2269','HJW9291','FME7210','TS35505')
   VDD      = @('MTT1337')            # virtual display the iPad receives
 }
 

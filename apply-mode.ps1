@@ -98,6 +98,9 @@ function Get-Live {
         Short = $short; Id = $r.'Monitor ID'; Active = ($r.Active -eq 'Yes')
         Primary = ($r.Primary -eq 'Yes'); Pos = $r.'Left-Top'; Res = $r.Resolution
         Frequency = $frequency; Orientation = $orientation
+        # Which GPU it hangs off - the discriminator that makes matching a
+        # generic-EDID panel by elimination safe.
+        Adapter = $r.Adapter
       }
     }
   }
@@ -106,6 +109,40 @@ function Get-Live {
 
 function Resolve-Role($live, $role) {
   foreach ($alias in $RoleAliases[$role]) { if ($live.ContainsKey($alias)) { return $live[$alias] } }
+
+  # Fallback: match by elimination.
+  #
+  # An adapter that fails to pass the monitor's EDID through leaves the panel
+  # with no identity at all - it enumerates as Default_Monitor with a blank
+  # name, so no alias can ever match it. Aliasing Default_Monitor directly is
+  # not safe: the iPad, laptop and Samsung also arrive as Default_Monitor, and
+  # the script would grab one of those instead.
+  #
+  # What separates them is the GPU. The physical panels hang off the NVIDIA
+  # adapter; streamed displays come in on their own (spacedesk, VDD). So look
+  # only at active displays on the same adapter as the roles that DID resolve,
+  # and accept the answer only when exactly one candidate remains.
+  if ($role -eq 'VDD') { return $null }   # never guess the virtual display
+
+  $claimed = @()
+  foreach ($other in $RoleAliases.Keys) {
+    foreach ($a in $RoleAliases[$other]) { if ($live.ContainsKey($a)) { $claimed += $a } }
+  }
+  $anchorAdapter = ($live.Values |
+    Where-Object { $_.Active -and $claimed -contains $_.Short -and $_.Adapter } |
+    Group-Object Adapter | Sort-Object Count -Descending | Select-Object -First 1).Name
+  if (-not $anchorAdapter) { return $null }
+
+  $cands = @($live.Values | Where-Object {
+    $_.Active -and $_.Adapter -eq $anchorAdapter -and $claimed -notcontains $_.Short })
+  if ($cands.Count -eq 1) {
+    Write-Host ("  NOTE: {0} has no known identity - matched '{1}' by elimination on {2}." -f $role, $cands[0].Short, $anchorAdapter) -ForegroundColor Yellow
+    Write-Host ("        Its EDID has gone generic. Add '{0}' to `$RoleAliases.{1} to make this deterministic." -f $cands[0].Short, $role) -ForegroundColor Yellow
+    return $cands[0]
+  }
+  if ($cands.Count -gt 1) {
+    Write-Host ("  WARN: {0} unidentified and {1} candidates on {2} - refusing to guess." -f $role, $cands.Count, $anchorAdapter) -ForegroundColor Yellow
+  }
   $null
 }
 

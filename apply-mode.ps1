@@ -318,7 +318,48 @@ if ($wargs.Count) {
   if ($LASTEXITCODE -ne 0) { Write-Host "  WARN: wallpaper helper returned $LASTEXITCODE" -ForegroundColor Yellow }
 }
 
-# --- 6. report ----------------------------------------------------------------
+# --- 6. taskbar auto-hide ------------------------------------------------------
+# A topology change knocks Explorer out of auto-hide WITHOUT changing the
+# setting: StuckRects3 still says auto-hide (byte 8, bit 0), the checkbox in
+# Settings still looks right, but the bar stays on screen. The live state lives
+# behind the AppBar API, so it has to be re-asserted rather than re-written.
+#
+# byte 8 holds the flags Explorer itself uses - bit 0 ABS_AUTOHIDE, bit 1
+# ABS_ALWAYSONTOP - so feeding that byte straight back restores exactly the
+# configured state instead of guessing at it.
+try {
+  $sr = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\StuckRects3'
+  $flags = (Get-ItemProperty -Path $sr -Name Settings -ErrorAction Stop).Settings[8]
+  if ($flags -band 0x01) {
+    if (-not ('TaskbarState' -as [type])) {
+      # Fully qualified on purpose: -UsingNamespace collides with the using
+      # statements Add-Type already generates.
+      Add-Type -Namespace Win -Name TaskbarState -MemberDefinition @'
+[System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+public struct RECT { public int left, top, right, bottom; }
+[System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+public struct APPBARDATA {
+  public uint cbSize; public System.IntPtr hWnd; public uint uCallbackMessage;
+  public uint uEdge; public RECT rc; public System.IntPtr lParam;
+}
+[System.Runtime.InteropServices.DllImport("shell32.dll", SetLastError=true)]
+public static extern System.IntPtr SHAppBarMessage(uint dwMessage, ref APPBARDATA pData);
+[System.Runtime.InteropServices.DllImport("user32.dll", SetLastError=true, CharSet=System.Runtime.InteropServices.CharSet.Unicode)]
+public static extern System.IntPtr FindWindow(string cls, string win);
+'@ -ErrorAction Stop
+    }
+    $abd = New-Object Win.TaskbarState+APPBARDATA
+    $abd.cbSize = [System.Runtime.InteropServices.Marshal]::SizeOf($abd)
+    $abd.hWnd   = [Win.TaskbarState]::FindWindow('Shell_TrayWnd', $null)
+    $abd.lParam = [IntPtr]([int]$flags)
+    [void][Win.TaskbarState]::SHAppBarMessage(0x0000000A, [ref]$abd)   # ABM_SETSTATE
+    Write-Host "  taskbar auto-hide re-asserted"
+  }
+} catch {
+  Write-Host "  WARN: could not re-assert taskbar auto-hide: $_" -ForegroundColor Yellow
+}
+
+# --- 7. report ----------------------------------------------------------------
 # Everything here can fail silently, so verify against what was asked for.
 $live = Get-Live
 Write-Host ""

@@ -17,3 +17,6 @@ mode.state
 
 # Written by the logon task at runtime.
 logon-layout.log
+
+# Local snapshots taken before overwriting a saved layout.
+*.bak

@@ -22,11 +22,20 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$d    = "D:\Programs\multimonitortool-x64"
-$mmt  = Join-Path $d 'MultiMonitorTool.exe'
-$ctl  = Join-Path $d 'DisplayCtl.exe'
-$wall = Join-Path $d 'SetWallpaper.exe'
-$tmp  = Join-Path $env:TEMP "mmt-state-$PID.txt"
+
+# Layout of this folder:
+#   <root>\*.bat          launchers, one per mode
+#   <root>\scripts\       this script and its helpers
+#   <root>\src\           C# sources
+#   <root>\bin\           what those sources compile to
+#   <root>\layouts\       saved .cfg geometry
+# Derived from the script's own location so the tree can be moved or renamed.
+$d       = Split-Path -Parent $PSScriptRoot
+$mmt     = Join-Path $d 'MultiMonitorTool.exe'
+$ctl     = Join-Path $d 'bin\DisplayCtl.exe'
+$wall    = Join-Path $d 'bin\SetWallpaper.exe'
+$layouts = Join-Path $d 'layouts'
+$tmp     = Join-Path $env:TEMP "mmt-state-$PID.txt"
 
 # A role may appear under any of these short monitor IDs. Add new aliases here if
 # a panel shows up under another name after a port change.
@@ -223,7 +232,7 @@ $live = Get-Live
 $want = @{}
 
 if ($m.Cfg) {
-  $cfg = Read-Cfg (Join-Path $d $m.Cfg)
+  $cfg = Read-Cfg (Join-Path $layouts $m.Cfg)
   foreach ($role in $m.On) {
     $e = Get-CfgEntry $cfg $role
     if (-not $e) { Write-Host "  WARN: no $role entry in $($m.Cfg)" -ForegroundColor Yellow; continue }
@@ -319,18 +328,37 @@ if ($wargs.Count) {
 }
 
 # --- 6. taskbar auto-hide ------------------------------------------------------
-# A topology change knocks Explorer out of auto-hide WITHOUT changing the
-# setting: StuckRects3 still says auto-hide (byte 8, bit 0), the checkbox in
-# Settings still looks right, but the bar stays on screen. The live state lives
-# behind the AppBar API, so it has to be re-asserted rather than re-written.
+# The taskbar loses auto-hide around a display change in two different ways, and
+# both are handled here.
 #
-# byte 8 holds the flags Explorer itself uses - bit 0 ABS_AUTOHIDE, bit 1
-# ABS_ALWAYSONTOP - so feeding that byte straight back restores exactly the
-# configured state instead of guessing at it.
+#   1. The LIVE state drops while the setting stays correct. StuckRects3 still
+#      says auto-hide (byte 8, bit 0) and the checkbox in Settings still looks
+#      right, but the bar sits on screen. That state lives behind the AppBar API
+#      and has to be re-asserted, not re-written.
+#
+#   2. The SETTING itself gets cleared - byte 8 seen going 3 -> 2, auto-hide bit
+#      off. Observed after Explorer restarts, most likely the taskbar-autohide-
+#      better Windhawk mod writing state as it unloads and reloads.
+#
+# So: force bit 0 on in the registry if something has cleared it, then push the
+# whole byte through ABM_SETSTATE. Bit 1 (ABS_ALWAYSONTOP) is preserved rather
+# than assumed, so only the auto-hide bit is ever forced.
+#
+# NOTE this is deliberately assertive - it will turn auto-hide back ON even if it
+# was switched off in Settings on purpose. That is the requested behaviour
+# ("always hide"). To make it respect the setting again, drop the -bor below and
+# guard on ($flags -band 0x01) instead.
 try {
   $sr = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\StuckRects3'
-  $flags = (Get-ItemProperty -Path $sr -Name Settings -ErrorAction Stop).Settings[8]
-  if ($flags -band 0x01) {
+  $bytes = (Get-ItemProperty -Path $sr -Name Settings -ErrorAction Stop).Settings
+  if (-not ($bytes[8] -band 0x01)) {
+    $was = $bytes[8]
+    $bytes[8] = $bytes[8] -bor 0x01
+    Set-ItemProperty -Path $sr -Name Settings -Value $bytes
+    Write-Host "  taskbar auto-hide was disabled (byte8 $was) - turned back on"
+  }
+  $flags = $bytes[8]
+  if ($true) {
     if (-not ('TaskbarState' -as [type])) {
       # Fully qualified on purpose: -UsingNamespace collides with the using
       # statements Add-Type already generates.

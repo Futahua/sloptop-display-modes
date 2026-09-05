@@ -6,8 +6,8 @@ readme.txt
 files.zip
 
 # Build outputs - sources are tracked, binaries are not.
-SetWallpaper.exe
-DisplayCtl.exe
+bin/SetWallpaper.exe
+bin/DisplayCtl.exe
 
 # Local snapshots taken while debugging.
 _backup-predell/
@@ -17,6 +17,7 @@ mode.state
 
 # Written by the logon task at runtime.
 logon-layout.log
+scripts/logon-layout.log
 
 # Local snapshots taken before overwriting a saved layout.
 *.bak

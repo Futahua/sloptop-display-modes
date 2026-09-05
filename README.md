@@ -12,14 +12,27 @@ topology change while still returning success.
 
 ## Layout
 
+```
+<root>\*.bat                  launchers, one per mode
+<root>\scripts\               all logic
+<root>\src\                   C# sources
+<root>\bin\                   what those compile to (gitignored)
+<root>\layouts\               saved .cfg geometry
+```
+
 | File | Role |
 |---|---|
-| `apply-mode.ps1` | All the logic. Resolves monitors by role, applies a mode, verifies the result. |
-| `*.bat` | One-line wrappers: `apply-mode.ps1 -Mode <name>` |
-| `*.cfg` | Saved layouts, written by MultiMonitorTool's GUI |
-| `SetWallpaper.cs` | Per-monitor wallpaper via `IDesktopWallpaper` |
-| `DisplayCtl.cs` | CCD attach/detach and dynamic geometry |
-| `regenerate-modes.ps1` | Superseded by `apply-mode.ps1`; kept for reference |
+| `scripts\apply-mode.ps1` | All the logic. Resolves monitors by role, applies a mode, verifies the result. |
+| `scripts\logon-layout.ps1` | Run by the logon task; applies sloptop and syncs `mode.state`. |
+| `scripts\regenerate-modes.ps1` | Superseded by `apply-mode.ps1`; kept for reference |
+| `src\SetWallpaper.cs` | Per-monitor wallpaper via `IDesktopWallpaper` |
+| `src\DisplayCtl.cs` | CCD attach/detach and dynamic geometry |
+| `src\Build tools.bat` | Compiles both into `bin\` |
+| `*.bat` | One-line wrappers: `scripts\apply-mode.ps1 -Mode <name>` |
+| `layouts\*.cfg` | Saved layouts, written by MultiMonitorTool's GUI |
+
+Paths are derived from `\`, and the launchers use `%~dp0`, so the
+folder can be moved or renamed.
 
 Modes: `sloptop`, `ipad`, `samsung`, `ipadmon`, `ipadlap`.
 

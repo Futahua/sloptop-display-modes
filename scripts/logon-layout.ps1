@@ -15,13 +15,13 @@
 # would make the next toggle press a no-op.
 
 $ErrorActionPreference = 'Continue'
-$d     = "D:\Programs\multimonitortool-x64"
+$d     = Split-Path -Parent $PSScriptRoot
 $state = "D:\Letters\MatTroiSeConMoc\Papers\User Generated\mode.state"
-$log   = Join-Path $d 'logon-layout.log'
+$log   = Join-Path $PSScriptRoot 'logon-layout.log'
 
 $stamp = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
 try {
-  $out = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $d 'apply-mode.ps1') -Mode sloptop 2>&1
+  $out = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'apply-mode.ps1') -Mode sloptop 2>&1
   $rc  = $LASTEXITCODE
   "[$stamp] apply-mode sloptop -> exit $rc" | Out-File -FilePath $log -Append -Encoding utf8
   $out | Out-File -FilePath $log -Append -Encoding utf8

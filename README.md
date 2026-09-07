@@ -39,6 +39,13 @@ Modes: `sloptop`, `ipad`, `samsung`, `ipadmon`, `ipadlap`.
 A separate `TOGGLE MODE.bat` (outside this repo, under `Papers\User Generated\`)
 alternates between `sloptop` and `ipad` using a `mode.state` file.
 
+`scripts\toggle-hotkey.ahk` binds **Ctrl+Win+Shift+X** to that toggle, and
+**Ctrl+Win+Shift+R** to reload itself. It runs from a Startup shortcut. A Windows
+`.lnk` hotkey cannot express this combination — shortcut hotkeys allow
+Ctrl+Alt+key and Ctrl+Shift+key but not the Win key — so a hotkey daemon is the
+only route. It is deliberately separate from `sloptop_engine.ahk` so neither can
+break the other.
+
 ## Why it is shaped this way
 
 Four non-obvious behaviours drove the design. Each one silently produced a wrong

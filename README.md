@@ -31,7 +31,7 @@ topology change while still returning success.
 | `*.bat` | One-line wrappers: `scripts\apply-mode.ps1 -Mode <name>` |
 | `layouts\*.cfg` | Saved layouts, written by MultiMonitorTool's GUI |
 
-Paths are derived from `\`, and the launchers use `%~dp0`, so the
+Paths are derived from `$PSScriptRoot`, and the launchers use `%~dp0`, so the
 folder can be moved or renamed.
 
 Modes: `sloptop`, `ipad`, `samsung`, `ipadmon`, `ipadlap`.

@@ -187,7 +187,7 @@ $missing = @($m.On | Where-Object { $r = Resolve-Role $live $_; -not $r -or -not
 if ($missing.Count) {
   $aliases = @(); foreach ($role in $missing) { $aliases += $RoleAliases[$role] }
   Write-Host "  attaching: $($missing -join ', ')"
-  & $ctl enable @aliases
+  & $ctl enable @aliases --save
   if ($LASTEXITCODE -ne 0) { Write-Host "  WARN: attach returned $LASTEXITCODE" -ForegroundColor Yellow }
   Start-Sleep -Seconds 6
   $live = Get-Live
@@ -206,7 +206,7 @@ for ($pass = 1; $pass -le 4; $pass++) {
   }
   if (-not $offNow.Count) { break }
   Write-Host "  detach pass $pass : $($offNow -join ', ')"
-  & $ctl disable @offNow | Out-Null
+  & $ctl disable @offNow --save | Out-Null
   if ($LASTEXITCODE -ne 0) { Write-Host "  WARN: detach returned $LASTEXITCODE" -ForegroundColor Yellow }
   Start-Sleep -Seconds 5
 }
@@ -285,9 +285,17 @@ if ($want.Count) {
     $specs += "{0}={1},{2},{3},{4},{5},{6}" -f $mon.Short, ($w.X - $dx), ($w.Y - $dy), $w.W, $w.H, $w.Orient, $w.Hz
   }
   if ($specs.Count) {
-    & $ctl layout @specs
-    if ($LASTEXITCODE -ne 0) { Write-Host "  WARN: layout returned $LASTEXITCODE" -ForegroundColor Yellow }
-    Start-Sleep -Seconds 4
+    # Twice, deliberately. A monitor positioned early can be shoved aside when a
+    # LATER one changes shape - rotating the portrait panel to 1080x1920 resizes
+    # its footprint, and Windows displaces whatever it now overlaps. Seen as
+    # SAC2453 landing correctly at 0,-1080 and then being pushed to 1920,-1726
+    # once the AOC rotated. The second pass runs when every panel already has its
+    # final size, so nothing moves underneath it.
+    for ($pass = 1; $pass -le 2; $pass++) {
+      & $ctl layout @specs
+      if ($LASTEXITCODE -ne 0) { Write-Host "  WARN: layout pass $pass returned $LASTEXITCODE" -ForegroundColor Yellow }
+      Start-Sleep -Seconds 4
+    }
   }
 }
 
